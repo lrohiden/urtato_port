@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>浦戸諸島 乗り場と次の船</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1a1a1a; --sub:#666; --line:#e2e4e8; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16181b; --card:#22252a; --text:#eee; --sub:#9aa0a6; --line:#33373d; }
+  }
+  body { margin:0; font-family:system-ui,sans-serif; background:var(--bg); color:var(--text); }
+  #bar { padding:8px 12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; font-size:13px; }
+  button, select { font-size:14px; padding:6px 10px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--text); }
+  #map { height:55vh; width:100%; }
+  #status { color:var(--sub); font-size:12px; padding:6px 12px 0; }
+  #list { padding:4px 12px 16px; }
+  .port { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin:8px 0; cursor:pointer; }
+  .head { display:flex; justify-content:space-between; align-items:baseline; }
+  .name { font-weight:bold; font-size:16px; }
+  .dist { color:var(--sub); font-size:13px; }
+  .dep { margin-top:6px; font-size:14px; }
+  .arr { color:var(--sub); font-size:12px; margin-bottom:4px; }
+  .ok { color:#1a8f3c; } .warn { color:#c28a00; } .ng { color:#d12f2f; font-weight:bold; }
+  .sub { color:var(--sub); font-size:12px; margin-top:6px; line-height:1.5; }
+  .leaflet-popup-content { color:#1a1a1a; font-size:13px; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <button id="reload">現在地を更新</button>
+  <button id="fitIsl">島</button>
+  <button id="fitAll">塩竈まで</button>
+  <select id="mode"><option value="walk">徒歩</option><option value="car">車</option></select>
+  <select id="dir">
+    <option value="toShio">塩竈行き</option>
+    <option value="toIsland">島行き</option>
+    <option value="all">両方向</option>
+  </select>
+  <label><input type="checkbox" id="holiday"> 今日は祝日</label>
+</div>
+<div id="map"></div>
+<div id="status">現在地を取得中…</div>
+<div id="list"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+/* ============ データ(塩竈市営汽船 令和7年10月1日改正の時刻表) ============
+   出典: https://urato-island.jp/kisen/  改正があれば下の表を書き換える */
+const STOPS = ["塩竈", "桂島", "野々島", "石浜", "寒風沢", "朴島"];
+
+// 座標はGoogleマップのプラスコードから変換した値です(桟橋の位置とは数十m程度ずれることがあります)
+const COORDS = {
+  "塩竈":   [38.31944, 141.03019],  // 829J+Q3 マリンゲート塩釜(桟橋までは徒歩2〜3分)
+  "桂島":   [38.33631, 141.09094],  // 83PR+G9
+  "野々島": [38.33794, 141.10569],  // 84Q4+57
+  "石浜":   [38.33294, 141.10256],  // 84M3+52
+  "寒風沢": [38.33844, 141.11794],  // 84Q9+95
+  "朴島":   [38.34854, 141.12442],  // 84XF+GX(座標は指定値に更新)
+};
+// 座標の地点から実際に乗船できる場所までの追加所要時間(分)
+const EXTRA_MIN = { "塩竈": 3 };
+
+// 下り(塩竈→朴島) 各行=1便、列はSTOPSの順。第1便のみ「運休日あり」
+const DOWN = [
+  ["5:30","5:48","5:54","5:57","6:05","6:13"],
+  ["7:20","7:38","7:45","7:49","7:57","8:05"],
+  ["9:30","9:48","9:55","9:59","10:07","10:15"],
+  ["11:30","11:48","11:55","11:59","12:07","12:15"],
+  ["13:30","13:48","13:55","13:59","14:07","14:15"],
+  ["15:45","16:03","16:10","16:14","16:22","16:30"],
+  ["18:15","18:32","18:37","18:40","18:47","18:55"],
+];
+const DOWN_RULE = ["運休日あり","毎日","毎日","毎日","毎日","毎日","毎日"];
+
+// 上り(朴島→塩竈) 列は 朴島,寒風沢,石浜,野々島,桂島,塩竈。null=通過。第7便は火・金のみ
+const UP = [
+  ["6:15","6:23","6:31","6:34","6:40","6:58"],
+  ["8:10","8:18","8:26","8:30","8:37","8:55"],
+  ["10:25","10:33","10:41","10:45","10:52","11:10"],
+  ["12:25","12:33","12:41","12:45","12:52","13:10"],
+  ["14:25","14:33","14:41","14:45","14:52","15:10"],
+  ["16:40","16:48","16:56","17:00","17:07","17:25"],
+  ["18:55",null,null,"19:08",null,"19:35"],
+];
+const UP_RULE = ["毎日","毎日","毎日","毎日","毎日","毎日","火金"];
+const UP_ORDER = ["朴島","寒風沢","石浜","野々島","桂島","塩竈"];
+
+const WALK_KMH = 4.5, CAR_KMH = 30, DETOUR = 1.3;
+const NEXT_COUNT = 2;   // 何便先まで表示するか
+/* ======================================================================= */
+
+// 乗り場ごとの出発リストを組み立てる
+// その便が、出発した乗り場より先で停まる各乗り場の到着時刻(通過する乗り場は除く)
+function laterStops(names, trip, i) {
+  const r = [];
+  for (let j = i + 1; j < names.length; j++) if (trip[j]) r.push(`${names[j]} ${trip[j]}`);
+  return r;
+}
+const PORTS = STOPS.map(n => ({ name: n, lat: COORDS[n][0], lng: COORDS[n][1], departures: [] }));
+const byName = Object.fromEntries(PORTS.map(p => [p.name, p]));
+DOWN.forEach((trip, t) => trip.forEach((time, i) => {
+  if (time && i < STOPS.length - 1)
+    byName[STOPS[i]].departures.push({ time, dir: "toIsland", label: "朴島方面", rule: DOWN_RULE[t], later: laterStops(STOPS, trip, i) });
+}));
+UP.forEach((trip, t) => trip.forEach((time, i) => {
+  if (time && i < UP_ORDER.length - 1)
+    byName[UP_ORDER[i]].departures.push({ time, dir: "toShio", label: "塩竈行き", rule: UP_RULE[t], later: laterStops(UP_ORDER, trip, i) });
+}));
+PORTS.forEach(p => p.departures.sort((a, b) => a.time.padStart(5, "0").localeCompare(b.time.padStart(5, "0"))));
+
+// 運航日判定
+function runs(rule, now, holiday) {
+  const m = now.getMonth() + 1, d = now.getDate(), w = now.getDay();
+  const off = (m === 12 && d === 31) || (m === 1 && d <= 3) || (m === 8 && d >= 14 && d <= 16);
+  if (rule === "毎日") return true;
+  if (rule === "運休日あり") return !(w === 0 || holiday || off);
+  if (rule === "火金") return (w === 2 || w === 5) && !(holiday || off);
+  return true;
+}
+const ruleMark = r => r === "運休日あり" ? "※" : r === "火金" ? "(火・金のみ)" : "";
+
+// 地図(国土地理院タイル)
+const ISLAND_PORTS = ["桂島", "野々島", "石浜", "寒風沢", "朴島"];
+const BOUNDS = [[38.29, 141.00], [38.40, 141.17]];   // 動かせる範囲(塩竈〜浦戸)
+const map = L.map("map", { minZoom: 12, maxBounds: BOUNDS, maxBoundsViscosity: 0.8 })
+  .setView([38.340, 141.11], 14);
+const attr = '<a href="https://maps.gsi.go.jp/development/ichiran.html">地理院タイル</a>';
+const std = L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png", { maxZoom: 18, attribution: attr });
+const photo = L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg", { maxZoom: 18, attribution: attr });
+std.addTo(map);
+L.control.layers({ "地図": std, "航空写真": photo }).addTo(map);
+function fitIslands() {
+  map.fitBounds(L.latLngBounds(PORTS.filter(p => ISLAND_PORTS.includes(p.name))
+    .map(p => [p.lat, p.lng])).pad(0.15));
+}
+function fitAll() {
+  map.fitBounds(L.latLngBounds(PORTS.map(p => [p.lat, p.lng])).pad(0.2));
+}
+fitIslands();
+
+// 座標調整用: 地図をクリックすると座標を表示
+map.on("click", e => L.popup().setLatLng(e.latlng)
+  .setContent(`${e.latlng.lat.toFixed(4)}, ${e.latlng.lng.toFixed(4)}`).openOn(map));
+
+function popupHtml(p) {
+  const f = (arr) => arr.map(d => `${d.time}${ruleMark(d.rule)}`).join(" ");
+  const s = p.departures.filter(d => d.dir === "toShio");
+  const i = p.departures.filter(d => d.dir === "toIsland");
+  return `<b>${p.name}</b>` +
+    (s.length ? `<br>塩竈行き: ${f(s)}` : "") +
+    (i.length ? `<br>朴島方面: ${f(i)}` : "");
+}
+const portMarkers = PORTS.map(p => L.marker([p.lat, p.lng]).addTo(map)
+  .bindTooltip(p.name, { permanent: true, direction: "right", offset: [8, -18] })
+  .bindPopup(popupHtml(p)));
+let meMarker = null, meCircle = null, pos = null, fitted = false;
+
+function distKm(a, b, c, d) {
+  const R = 6371, rad = x => x * Math.PI / 180;
+  const dLat = rad(c - a), dLng = rad(d - b);
+  const h = Math.sin(dLat/2)**2 + Math.cos(rad(a))*Math.cos(rad(c))*Math.sin(dLng/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+function toDate(hhmm, now) {
+  const [h, m] = hhmm.split(":").map(Number);
+  const d = new Date(now); d.setHours(h, m, 0, 0); return d;
+}
+function fmtMin(m) {
+  m = Math.round(m);
+  return m >= 60 ? `${Math.floor(m/60)}時間${m%60}分` : `${m}分`;
+}
+
+function render() {
+  if (!pos) return;
+  const now = new Date();
+  const car = document.getElementById("mode").value === "car";
+  const dir = document.getElementById("dir").value;
+  const holiday = document.getElementById("holiday").checked;
+  const kmh = car ? CAR_KMH : WALK_KMH;
+
+  const rows = PORTS.map((p, i) => {
+    const deps = p.departures.filter(d => dir === "all" || d.dir === dir);
+    if (!deps.length) return null;
+    const km = distKm(pos.lat, pos.lng, p.lat, p.lng) * DETOUR;
+    const travelMin = km / kmh * 60 + (EXTRA_MIN[p.name] || 0);
+    const arrive = new Date(now.getTime() + travelMin * 60000);
+    const nexts = deps.filter(d => runs(d.rule, now, holiday))
+      .map(d => ({ ...d, at: toDate(d.time, now) }))
+      .filter(d => d.at > arrive)
+      .sort((a, b) => a.at - b.at)
+      .slice(0, NEXT_COUNT)
+      .map(d => ({ ...d, margin: (d.at - arrive) / 60000 }));
+    return { p, i, km, travelMin, nexts };
+  }).filter(Boolean).sort((a, b) => a.travelMin - b.travelMin);
+
+  document.getElementById("list").innerHTML = rows.map(r => {
+    let dep;
+    if (!r.nexts.length) dep = `<span class="ng">本日これから間に合う便はありません</span>`;
+    else dep = r.nexts.map((n, k) => {
+      const cls = n.margin < 10 ? "ng" : n.margin < 20 ? "warn" : "ok";
+      return `<div>${k ? "その次" : "次"}: ${n.time}発 ${n.label}${ruleMark(n.rule)} <span class="${cls}">(余裕 ${fmtMin(n.margin)})</span><div class="arr">到着: ${n.later.join(" / ")}</div></div>`;
+    }).join("");
+    return `<div class="port" data-i="${r.i}">
+      <div class="head"><span class="name">${r.p.name}</span>
+        <span class="dist">${r.km.toFixed(1)}km ・ ${car ? "車約" : "徒歩約"}${fmtMin(r.travelMin)}</span></div>
+      <div class="dep">${dep}</div></div>`;
+  }).join("") +
+  `<div class="sub">徒歩・車の時間は、現在地から乗り場までの直線距離をもとにした目安です(坂や道の曲がりで前後します)。<br>※は日曜・祝日・12/31〜1/3・8/14〜8/16運休。余裕は「到着見込み→出航」の差です(乗船は出航20分前から可能)。
+  天候や海況で時刻・運航が変わることがあります。祝日は上のチェックで切り替えてください。</div>`;
+
+  document.querySelectorAll(".port").forEach(el => el.onclick = () => {
+    const m = portMarkers[+el.dataset.i];
+    map.setView(m.getLatLng(), 15); m.openPopup();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  });
+  document.getElementById("status").textContent =
+    `現在地取得: ${now.toLocaleTimeString("ja-JP", {hour:"2-digit", minute:"2-digit"})}(精度 約${Math.round(pos.acc)}m)`;
+}
+
+function updateMe() {
+  const ll = [pos.lat, pos.lng];
+  if (!meMarker) {
+    meCircle = L.circle(ll, { radius: pos.acc, weight: 1, fillOpacity: 0.1 }).addTo(map);
+    meMarker = L.circleMarker(ll, { radius: 8, color: "#fff", weight: 2, fillColor: "#2563eb", fillOpacity: 1 })
+      .addTo(map).bindTooltip("現在地");
+  } else { meMarker.setLatLng(ll); meCircle.setLatLng(ll).setRadius(pos.acc); }
+  if (!fitted) {
+    // 浦戸〜塩竈の範囲内にいるとき、現在地と最寄りの乗り場が収まる大きさまで寄る
+    // 範囲外(遠方)なら、島全体の表示のままにする
+    if (L.latLngBounds(BOUNDS).contains(ll)) {
+      const nearest = PORTS.reduce((a, b) =>
+        distKm(pos.lat, pos.lng, a.lat, a.lng) < distKm(pos.lat, pos.lng, b.lat, b.lng) ? a : b);
+      map.fitBounds(L.latLngBounds([ll, [nearest.lat, nearest.lng]]).pad(0.5), { maxZoom: 16 });
+    }
+    fitted = true;
+  }
+}
+
+function locate() {
+  const st = document.getElementById("status");
+  st.textContent = "現在地を取得中…";
+  if (!navigator.geolocation) { st.textContent = "このブラウザは位置情報に対応していません"; return; }
+  navigator.geolocation.getCurrentPosition(
+    g => { pos = { lat: g.coords.latitude, lng: g.coords.longitude, acc: g.coords.accuracy }; updateMe(); render(); },
+    () => { st.textContent = "位置情報を取得できませんでした(許可設定を確認してください)"; },
+    { enableHighAccuracy: true, timeout: 15000, maximumAge: 10000 }
+  );
+}
+document.getElementById("reload").onclick = locate;
+document.getElementById("fitIsl").onclick = fitIslands;
+document.getElementById("fitAll").onclick = fitAll;
+["mode", "dir", "holiday"].forEach(id => document.getElementById(id).onchange = render);
+setInterval(render, 30000);
+locate();
+</script>
+</body>
+</html>
